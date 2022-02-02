@@ -1,0 +1,245 @@
+import invoke from '@salesforce/apex/nFORCE.AuraApi_v1.invoke';
+
+import cppModalBreakChar from '@salesforce/label/c.???';
+
+/**
+ @constructor
+ @abstract
+*/
+export default class cppModalService extends LightningElement {
+
+    calculationInvokeTemplate;
+    loaderInvokeTemplate;
+    removerInvokeTemplate;
+    saverInvokeTemplate;
+
+    createAnInvokeTemplate = (beanName, args) => {
+        return {
+            ACTION: beanName,
+            ACTION_ARGS: {...args}
+        }
+    }
+
+    isLoading = false;
+    modalConfig;
+
+    constructor() {
+        super();
+        this.template.addEventListener(PRICING_FIELD_UPDATE_EVENT, (event) => this.handleUpdate(event));
+    }
+
+    calculate() {
+
+    }
+
+    clearForm() {
+        for (const section of this.modalConfig.sections) {
+            for (const field of section.fields) {
+                this.Field.setValue(field.guid, null);
+				field.previousValue = null;
+            }
+		}
+
+    }
+
+    async connectedCallback() {
+        await this.load();
+        this.resetModalUI();
+    }
+
+    getFieldByGuid(guid) {
+        return this.modalConfig.section[splitGuid(guid)[0]].fields[splitGuid(guid)[1]];
+    }
+
+    handleUpdate(event) {
+        try {
+			let eventField = event.detail.field;
+
+			this.Field.setValue(eventField.guid, event.detail.value);
+        } catch (err) {
+			handleError(err);
+		}
+    }
+
+    async load() {
+		this.isLoading = true;
+
+		try {
+
+            config = this.modalConfig ? this.modalConfig : 
+                JSON.parse(await invoke({ 
+                    params: this.loaderInvokeTemplate
+                }).results);
+			
+            this.modalConfig = config;
+        
+		} catch (err) {
+			handleError(err);
+		} finally {
+            this.isLoading = false
+        }
+
+    }
+
+    async remove() {
+        this.isLoading = true;
+
+		try {
+			await invoke({ params: this.removerInvokeTemplate });
+			this.modalController = [];
+		} catch (err) {
+			handleError(err);
+		}
+
+        this.isLoading = false;
+    }
+
+
+    resetModalUI() {
+        this.isLoading = true;
+        
+        for (const section of this.modalConfig.sections) {
+            for (const field of section.fields) {
+                this.Field.setValue(field.guid, field.value);
+            }
+        }
+
+        this.isLoading = false;
+    }
+
+    save() {
+        this.isLoading = true;
+
+		try {
+			await invoke({ params: this.saverInvokeTemplate });
+			this.dispatchEvent(new CustomEvent('savesuccess'));
+		} catch (err) {
+            this.dispatchEvent(new CustomEvent('savefailure'));
+			handleError(err);
+		}
+
+		this.isLoading = false;
+    }
+
+    static splitGuid(guid) {
+        return guid.split('-');
+    }
+
+
+    Field = class {
+        static setValue(guid, newValue) {    
+            let field = cppModalService.prototype.getFieldByGuid(guid);
+
+            const cleanValue = (htmlType, newValue) => {
+                switch (htmlType) {
+                    case 'datetime-local':
+                        return new Date(newValue) || null;
+                    case 'number':
+                        return Number(newValue) || null;
+                    case 'picklist':
+                        return newValue ?? '';
+                    case 'text':
+                        return newValue ?? '';
+                    case 'toggle':
+                        return Boolean(newValue) || false;
+                    default:
+                        return newValue;
+                }
+            }
+    
+            if (!field.hidden) {
+                field.previousValue = field.value;
+            }
+            if (field.value != cleanValue(field.htmlType, newValue)) {
+                field.value = cleanValue(field.htmlType, newValue);
+
+                for (const dependentGuid of field.dependentFieldGuids) {
+                    this.#updateDependent(guid, dependentGuid);
+                }
+            }
+        }
+
+        static #updateDependent(parentGuid, fieldGuid) {
+            if (!fieldGuid || !/[0-9]+/.test(this.getIndexByGuid(fieldGuid)[0])) return;
+
+            let field = cppModalService.prototype.getFieldByGuid(fieldGuid);
+
+            const getDependOptionInfo = (parentGuid, field) => {
+                if (
+                    !(
+                        field.dependentOptions ??
+                        (parentGuid in field.dependentOptions || '*' in field.dependentOptions)
+                    )
+                ) {
+                    return;
+                }
+        
+                changedGuid = changedGuid in field.dependentOptions ? changedGuid : '*';
+        
+                let splitControllingFields = [];
+                if (field.controllerFieldGuids?.length > 0) {
+                    field.controllerFieldGuids.forEach((guid) => {
+                        splitControllingFields.push(cppModalService.prototype.getFieldByGuid(guid).value);
+                    });
+                }
+        
+                let selectedOption;
+                for (let i = 0; !selectedOption; i++) {
+                    const reversedBinaryIndex = [
+                        ...i.toString(2).padStart(splitControllingFields.length, '0'),
+                    ].reverse();
+                    const controllingValues =
+                        splitControllingFields?.length
+                            ? splitControllingFields
+                                    .map((controllingFieldValue, j) => {
+                                        if (reversedBinaryIndex[j] === '1') return '*';
+                                        else return controllingFieldValue;
+                                    })
+                                    .join(cppModalBreakChar)
+                                    .toLowerCase()
+                            : '*';
+                    selectedOption = field.dependentOptions[changedGuid][controllingValues];
+                    if (i > splitControllingFields.length ** 2) {
+                        return;
+                    }
+                }
+                return selectedOption;
+            }
+
+            const evaluateFormulaField = (formula, fieldGuid) => {
+                const guids = formula.match(/(?<=\{)\w+-\w+(?=\})/g);
+                let evaluatedFormula = formula;
+                for (let i = 0; i < guids?.length; i++) {
+                    evaluatedFormula = evaluatedFormula.replace(
+                        /\{\w+-\w+\}/,
+                        cppModalService.prototype.getFieldByGuid(guids[i])[guids[i] === fieldGuid ? 'previousValue' : 'value']
+                    );
+                }
+                return eval(evaluatedFormula);
+            }
+    
+            let selectedOption = getDependOptionInfo(parentGuid, field);
+            if (!selectedOption) return;
+    
+            if (selectedOption.formula != null) {
+                this.setValue(
+                    fieldGuid,
+                    evaluateFormulaField(selectedOption.formula, fieldGuid)
+                );
+            }
+    
+            if (selectedOption.disabled) {
+                field.disabled = selectedOption.disabled;
+            }
+            if (selectedOption.hidden) {
+                field.hidden = selectedOption.hidden;
+            }
+            if (selectedOption.readOnly) {
+                field.readOnly = selectedOption.readOnly;
+            }
+            if (field.dataType.htmlType === 'picklist' && selectedOption.picklistOptions) {
+                field.picklistOptions = selectedOption.picklistOptions;
+            }
+        }
+    };
+}
